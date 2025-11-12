@@ -80,7 +80,7 @@
 
 <script>
 let currentFacing="environment", stream, isRecording=false, mediaRecorder, recordedChunks=[];
-let firstPreview=false;
+let firstPreview=false, renderInterval;
 const v=document.getElementById("video");
 const glcanvas=document.getElementById("gl");
 const gl=glcanvas.getContext("webgl",{preserveDrawingBuffer:true});
@@ -117,23 +117,29 @@ const flipLoc=gl.getUniformLocation(prog,"flipX");
 
 async function startCamera(){
   if(stream) stream.getTracks().forEach(t=>t.stop());
-  const constraints={audio:true, video:{facingMode:currentFacing, width:{ideal:1920}, height:{ideal:1080}}};
+  if(renderInterval) clearInterval(renderInterval);
+  const constraints={audio:true, video:{facingMode:currentFacing, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:30,max:30}}};
   try {
     stream = await navigator.mediaDevices.getUserMedia(constraints);
     v.srcObject=stream; await v.play();
-    renderLoop();
+    stableRenderLoop(); // inicia loop fixo
   } catch(e) { console.error(e); }
 }
 
-function renderLoop(){
-  if(v.videoWidth===0){ requestAnimationFrame(renderLoop); return;}
-  glcanvas.width=innerWidth; glcanvas.height=innerHeight;
-  gl.viewport(0,0,glcanvas.width,glcanvas.height);
-  gl.bindTexture(gl.TEXTURE_2D,tex);
-  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,v);
-  gl.uniform1i(flipLoc, currentFacing==="user");
-  gl.drawArrays(gl.TRIANGLES,0,6);
-  requestAnimationFrame(renderLoop);
+function stableRenderLoop(){
+  const fps=30;
+  renderInterval=setInterval(()=>{
+    try{
+      if(v.videoWidth>0){
+        glcanvas.width=innerWidth; glcanvas.height=innerHeight;
+        gl.viewport(0,0,glcanvas.width,glcanvas.height);
+        gl.bindTexture(gl.TEXTURE_2D,tex);
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,v);
+        gl.uniform1i(flipLoc, currentFacing==="user");
+        gl.drawArrays(gl.TRIANGLES,0,6);
+      }
+    }catch(e){}
+  },1000/fps);
 }
 
 photoButton.onclick = () => {
