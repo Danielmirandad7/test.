@@ -7,7 +7,7 @@
 <style>
   body {margin:0; background:#000; overflow:hidden; height:100vh; display:flex; justify-content:center; align-items:center;}
   video, canvas#gl {position:absolute; top:0; left:0; width:100vw; height:100vh; object-fit:cover;}
-  canvas#gl {display:none;}
+  canvas#gl {background:#000;}
 
   #controls {position:absolute; bottom:50px; width:100%; display:flex; justify-content:center; align-items:center;}
   #recordButton {width:90px; height:90px; border-radius:50%; border:6px solid white; background:red; box-shadow:0 0 10px rgba(255,0,0,0.7); cursor:pointer; transition:transform .15s, box-shadow .3s;}
@@ -41,7 +41,7 @@
 </style>
 </head>
 <body>
-<video id="video" playsinline autoplay muted></video>
+<video id="video" playsinline autoplay muted style="display:none"></video>
 <canvas id="gl"></canvas>
 
 <div id="controls">
@@ -80,9 +80,12 @@
 
 <script>
 let currentFacing="environment", stream, isRecording=false, mediaRecorder, recordedChunks=[];
+let audioStream=null, audioTrack=null;
 let firstPreview=false;
+
 const v=document.getElementById("video");
 const glcanvas=document.getElementById("gl");
+const gl=glcanvas.getContext("webgl",{preserveDrawingBuffer:true});
 const recordButton=document.getElementById("recordButton");
 const photoButton=document.getElementById("photoButton");
 const preview=document.getElementById("previewContainer");
@@ -93,38 +96,70 @@ const tapPlay=document.getElementById("tapPlay");
 const shareBtn=document.getElementById("shareBtn");
 const closeBtn=document.getElementById("closeBtn");
 
+function createShader(type,src){const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); return s;}
+
+const vs=createShader(gl.VERTEX_SHADER,`attribute vec2 p; varying vec2 uv;
+void main(){ uv=(p+1.0)/2.0; uv.y=1.0-uv.y; gl_Position=vec4(p,0,1); }`);
+
+const fs=createShader(gl.FRAGMENT_SHADER,`precision mediump float; varying vec2 uv;
+uniform sampler2D t; uniform bool flipX;
+void main(){ vec2 texCoord=uv; if(flipX) texCoord.x=1.0-texCoord.x;
+gl_FragColor=texture2D(t,texCoord); }`);
+
+const prog=gl.createProgram();
+gl.attachShader(prog,vs);
+gl.attachShader(prog,fs);
+gl.linkProgram(prog);
+
+const buf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);
+
+gl.useProgram(prog);
+const loc=gl.getAttribLocation(prog,"p");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+
+const tex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+
+gl.uniform1i(gl.getUniformLocation(prog,"t"),0);
+const flipLoc=gl.getUniformLocation(prog,"flipX");
+
 async function startCamera(){
   if(stream) stream.getTracks().forEach(t=>t.stop());
-  const constraints={
-    audio:true,
-    video:{
-      facingMode:currentFacing,
-      width:{ideal:1920},
-      height:{ideal:1080},
-      frameRate:{ideal:30, max:30},
-      advanced:[{ imageStabilization:true }],
-      noiseSuppression:true,
-      echoCancellation:false,
-      autoGainControl:false
-    }
-  };
+  const constraints={audio:false, video:{facingMode:currentFacing, width:{ideal:1920}, height:{ideal:1080}}};
+
   try{
-    stream=await navigator.mediaDevices.getUserMedia(constraints);
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
     v.srcObject=stream;
     await v.play();
-    v.style.transform=(currentFacing==="user")?"scaleX(-1)":"scaleX(1)";
-  }catch(e){console.error("Erro ao iniciar câmera:",e);}
+    renderLoop();
+  }catch(e){console.error(e);}
 }
 
-photoButton.onclick=()=>{
-  const canvas=document.createElement("canvas");
-  canvas.width=v.videoWidth; canvas.height=v.videoHeight;
-  const ctx=canvas.getContext("2d");
-  if(currentFacing==="user"){ctx.translate(canvas.width,0);ctx.scale(-1,1);}
-  ctx.drawImage(v,0,0,canvas.width,canvas.height);
-  const data=canvas.toDataURL("image/png");
-  previewImg.src=data; previewImg.style.display="block";
-  previewVid.style.display="none"; preview.style.display="flex";
+function renderLoop(){
+  if(v.videoWidth===0){ requestAnimationFrame(renderLoop); return;}
+  glcanvas.width=innerWidth;
+  glcanvas.height=innerHeight;
+  gl.viewport(0,0,glcanvas.width,glcanvas.height);
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,v);
+  gl.uniform1i(flipLoc, currentFacing==="user");
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  requestAnimationFrame(renderLoop);
+}
+
+photoButton.onclick = () => {
+  const data = glcanvas.toDataURL("image/png");
+  previewImg.src = data;
+  previewImg.style.display="block";
+  previewVid.style.display="none";
+  preview.style.display="flex";
 };
 
 recordButton.onmousedown=startRec;
@@ -132,46 +167,91 @@ recordButton.onmouseup=stopRec;
 recordButton.ontouchstart=e=>{e.preventDefault();startRec();};
 recordButton.ontouchend=e=>{e.preventDefault();stopRec();};
 
-function startRec(){
+async function startRec(){
   if(isRecording)return;
   recordedChunks=[];
-  const mime=MediaRecorder.isTypeSupported("video/mp4")?"video/mp4":"video/webm";
-  mediaRecorder=new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:2500000});
+
+  const mime = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
+
+  /* 🔥 AQUI ESTÁ O AUMENTO DO VOLUME DO MICROFONE PARA 3.5x */
+  try {
+      audioStream = await navigator.mediaDevices.getUserMedia({audio:true});
+
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(audioStream);
+
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 3.5;   /* 🔊 volume 350% */
+
+      const dest = audioContext.createMediaStreamDestination();
+      source.connect(gainNode);
+      gainNode.connect(dest);
+
+      audioTrack = dest.stream.getAudioTracks()[0] || null;
+
+  } catch(e){
+      console.error("Erro ao acessar microfone:", e);
+      audioStream = null;
+      audioTrack = null;
+  }
+
+  const canvasStream = glcanvas.captureStream();
+
+  let mixedStream = canvasStream;
+  if(audioTrack){
+    mixedStream = new MediaStream([...canvasStream.getVideoTracks(), audioTrack]);
+  }
+
+  mediaRecorder=new MediaRecorder(mixedStream,{mimeType:mime});
   mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recordedChunks.push(e.data);};
+
   mediaRecorder.onstop=()=>{
+    if(audioTrack){ audioTrack.stop(); audioTrack=null; }
+    if(audioStream){ audioStream.getTracks().forEach(t=>t.stop()); audioStream=null; }
+
     const blob=new Blob(recordedChunks,{type:mime});
     const url=URL.createObjectURL(blob);
-    previewVid.src=url; previewVid.style.display="block"; previewImg.style.display="none";
-    preview.style.display="flex"; previewVid.muted=false;
-    previewVid.style.transform=(currentFacing==="user")?"scaleX(-1)":"scaleX(1)";
+    previewVid.src=url;
+    previewVid.style.display="block";
+    previewImg.style.display="none";
+    preview.style.display="flex";
+    previewVid.muted=false;
     previewVid.onended=()=>previewVid.play();
 
-    const canvas=document.createElement("canvas");
-    canvas.width=v.videoWidth; canvas.height=v.videoHeight;
-    const ctx=canvas.getContext("2d");
-    if(currentFacing==="user"){ctx.translate(canvas.width,0);ctx.scale(-1,1);}
-    ctx.drawImage(v,0,0,canvas.width,canvas.height);
-    frozenFrame.src=canvas.toDataURL("image/png");
+    glcanvas.toBlob(b=>{
+      const imgURL=URL.createObjectURL(b);
+      frozenFrame.src=imgURL;
+    },"image/png");
 
     if(!firstPreview){
-      frozenFrame.style.display="block"; tapPlay.style.display="block";
+      frozenFrame.style.display="block"; 
+      tapPlay.style.display="block";
       const handle=()=>{
-        frozenFrame.style.display="none";tapPlay.style.display="none";
-        previewVid.play().catch(()=>{}); firstPreview=true;
+        frozenFrame.style.display="none";
+        tapPlay.style.display="none";
+        previewVid.play().catch(()=>{});
+        firstPreview=true;
         previewVid.onended=()=>previewVid.play();
         preview.removeEventListener("touchstart",handle);
       };
       preview.addEventListener("touchstart",handle);
     } else {
-      frozenFrame.style.display="none"; tapPlay.style.display="none"; previewVid.play();
+      frozenFrame.style.display="none";
+      tapPlay.style.display="none";
+      previewVid.play();
     }
   };
+
   mediaRecorder.start();
-  isRecording=true; recordButton.style.background="darkred";
+  isRecording=true;
+  recordButton.style.background="darkred";
 }
+
 function stopRec(){
   if(!isRecording)return;
-  mediaRecorder.stop(); isRecording=false; recordButton.style.background="red";
+  mediaRecorder.stop();
+  isRecording=false;
+  recordButton.style.background="red";
 }
 
 shareBtn.onclick=async()=>{
@@ -196,9 +276,27 @@ shareBtn.onclick=async()=>{
   }catch(err){console.error("Erro ao compartilhar:",err);}
 };
 
-closeBtn.onclick=()=>{preview.style.display="none";previewVid.pause();previewVid.src="";frozenFrame.style.display="none";tapPlay.style.display="none";};
-document.getElementById("switch").onclick=()=>{currentFacing=(currentFacing==="environment"?"user":"environment");startCamera();};
-startCamera();
+closeBtn.onclick=()=>{
+  preview.style.display="none";
+  previewVid.pause();
+  previewVid.src="";
+  frozenFrame.style.display="none";
+  tapPlay.style.display="none";
+};
+
+document.getElementById("switch").onclick=()=>{
+  currentFacing=(currentFacing==="environment"?"user":"environment");
+  startCamera();
+};
+
+async function initCameraWithPermissions(){
+  try{
+    await navigator.mediaDevices.getUserMedia({audio:true, video:true});
+  }catch(e){console.error("Permissão negada:", e);}
+  startCamera();
+}
+
+initCameraWithPermissions();
 </script>
 </body>
 </html>
